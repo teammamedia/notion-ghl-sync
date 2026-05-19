@@ -2,7 +2,7 @@
 
 Automatiza a sincronização do **stage** de cada lead do Notion (BD *Comercial*) para o pipeline correspondente no **GoHighLevel**, mantendo as Smart Lists do GHL sempre certas para enviar newsletters segmentadas — sem ninguém ter de selecionar leads à mão.
 
-Corre todos os dias às **06:00 UTC** (≈ 07:00 Lisboa no horário de verão) através do **GitHub Actions** (grátis).
+Corre todos os domingos às **21:00 UTC** (= 22:00 Lisboa no verão, 21:00 no inverno) através do **GitHub Actions** (grátis). Também podes correr manualmente a qualquer momento pelo botão *Run workflow* no separador *Actions* (ex.: antes de uma campanha grande).
 
 ---
 
@@ -19,7 +19,7 @@ Corre todos os dias às **06:00 UTC** (≈ 07:00 Lisboa no horário de verão) a
 
 | Notion (`Status`) | GHL Stage |
 |---|---|
-| Novas Leads | Nova Lead |
+| Nova Lead | Nova Lead |
 | Contactada | Contactada |
 | Reunião Análise | Reunião Análise |
 | Reunião Follow Up | Reunião Follow Up |
@@ -32,7 +32,13 @@ Corre todos os dias às **06:00 UTC** (≈ 07:00 Lisboa no horário de verão) a
 | Monetização Fechada | Monetização Fechada |
 | **Perdida** | *(opportunity.status = lost)* |
 
-Se quiseres mudar/adicionar mapeamentos, edita o dicionário `STATUS_TO_STAGE` no topo do `sync.py`.
+### Auto-mapping (zero código para stages novos)
+
+Se adicionares um Status novo no Notion **e** um Stage no GHL com o **mesmo nome** (a comparação ignora maiúsculas, acentos e espaços extra — por exemplo "Aguarda Contrato" no Notion casa com "AGUARDA CONTRATO" ou "Aguarda contrato" no GHL), o script faz o match automático na próxima execução. **Sem mexer no código.**
+
+Só precisas de editar o dicionário `STATUS_TO_STAGE` no `sync.py` quando os nomes nos dois sistemas forem *propositadamente diferentes* — como o caso atual de "Fechado" (Notion) → "Fechada" (GHL).
+
+Stages **não são criados automaticamente** no GHL — tens de os criar no GHL → *Opportunities → ícone de configurações do pipeline → Add Stage* antes de o sync seguinte os conseguir usar.
 
 ---
 
@@ -88,7 +94,7 @@ Mesma coisa, mas mete `false` em DRY RUN (ou simplesmente espera pelas 06:00 UTC
 
 ## Trocas e ajustes
 
-- **Mudar a hora do sync**: edita o cron em `.github/workflows/sync.yml`. Por exemplo `"0 5 * * 1-5"` = às 05:00 UTC de segunda a sexta.
+- **Mudar a hora do sync**: edita o cron em `.github/workflows/sync.yml`. Atualmente `"0 21 * * 0"` (domingos 21h UTC). Outros exemplos: `"0 6 * * *"` = diário às 06h UTC; `"0 6 * * 1"` = segundas 06h UTC.
 - **Mudar mapping de stages**: edita o dicionário `STATUS_TO_STAGE` em `sync.py`, faz commit + push.
 - **Desativar temporariamente**: Actions → workflow → **Disable workflow**.
 - **Rodar tokens**: gera novos no Notion / GHL, atualiza os Secrets no GitHub.
