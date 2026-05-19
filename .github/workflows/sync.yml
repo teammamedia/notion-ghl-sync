@@ -8,7 +8,7 @@ on:
       dry_run:
         description: "Correr em modo DRY RUN (não escreve no GHL)"
         required: false
-        default: "false"
+        default: "true"
 
 jobs:
   sync:
