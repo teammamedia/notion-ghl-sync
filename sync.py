@@ -5,15 +5,8 @@ Sincronização Notion → GoHighLevel
 
 Lê leads da base de dados "Comercial" no Notion e mantém o stage de cada
 contacto/oportunidade alinhado no GHL, para que as Smart Lists do GHL
-fiquem sempre certas sem ninguém ter de mexer manualmente.
-
-Comportamento:
-- Para cada lead no Notion: procura no GHL por email; se não encontrar,
-  tenta por telefone; se ainda não encontrar, cria contacto + oportunidade.
-- Se a oportunidade já existir no pipeline, atualiza o stage.
-- Status "Perdida" no Notion → opportunity.status = "lost" no GHL
-  (mantém o último stage e desaparece das listas de leads abertos).
-- Modo DRY_RUN imprime tudo o que faria sem escrever no GHL.
+fiquem sempre certas para enviar newsletters segmentadas — sem ninguém
+ter de selecionar leads à mão.
 
 Variáveis de ambiente:
   NOTION_TOKEN       Integration secret do Notion (ntn_...)
@@ -26,9 +19,9 @@ Variáveis de ambiente:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -53,7 +46,7 @@ GHL_API = "https://services.leadconnectorhq.com"
 GHL_VERSION = "2021-07-28"
 
 # Mapeamento Notion `Status` → nome do GHL Stage (validado com o user)
-STATUS_TO_STAGE: dict[str, str] = {
+STATUS_TO_STAGE: dict = {
     "Novas Leads": "Nova Lead",
     "Contactada": "Contactada",
     "Reunião Análise": "Reunião Análise",
@@ -70,6 +63,18 @@ STATUS_TO_STAGE: dict[str, str] = {
 # Valores de Status que correspondem a oportunidade "lost" no GHL
 LOST_STATUSES = {"Perdida"}
 
+# Palavras-chave que indicam "contacto já existe" no body da resposta GHL
+DUPLICATE_KEYWORDS = (
+    "duplicat",
+    "already exist",
+    "already exists",
+    "contact exists",
+    "exists already",
+    "duplicate contact",
+)
+
+EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -78,10 +83,46 @@ log = logging.getLogger("sync")
 
 
 # ============================================================
+# Helpers de limpeza
+# ============================================================
+
+def normalize_phone_pt(phone):
+    """Normaliza telefones para E.164. Assume Portugal se não houver country code."""
+    if not phone:
+        return None
+    cleaned = "".join(c for c in phone if c.isdigit() or c == "+")
+    if not cleaned:
+        return None
+    if cleaned.startswith("+"):
+        return cleaned
+    if cleaned.startswith("00"):
+        return "+" + cleaned[2:]
+    if cleaned.startswith("351") and len(cleaned) >= 11:
+        return "+" + cleaned
+    # 9 dígitos começando por 2 (fixo PT) ou 9 (móvel PT) → assume +351
+    if len(cleaned) == 9 and cleaned[0] in "29":
+        return "+351" + cleaned
+    return cleaned
+
+
+def is_valid_email(email):
+    return bool(email and EMAIL_RE.match(email))
+
+
+def split_name(full):
+    if not full:
+        return "", ""
+    parts = full.strip().split(maxsplit=1)
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1]
+
+
+# ============================================================
 # Helpers Notion
 # ============================================================
 
-def notion_headers() -> dict:
+def notion_headers():
     return {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Notion-Version": NOTION_VERSION,
@@ -89,11 +130,11 @@ def notion_headers() -> dict:
     }
 
 
-def notion_query_all(database_id: str) -> Iterable[dict]:
+def notion_query_all(database_id):
     """Itera todas as páginas da base de dados (com pagination)."""
-    cursor: Optional[str] = None
+    cursor = None
     while True:
-        body: dict = {"page_size": 100}
+        body = {"page_size": 100}
         if cursor:
             body["start_cursor"] = cursor
         r = requests.post(
@@ -111,7 +152,7 @@ def notion_query_all(database_id: str) -> Iterable[dict]:
         cursor = data.get("next_cursor")
 
 
-def notion_prop(page: dict, name: str, ptype: str):
+def notion_prop(page, name, ptype):
     """Extrai o valor escalar de uma propriedade do Notion."""
     prop = page.get("properties", {}).get(name)
     if not prop:
@@ -139,7 +180,7 @@ def notion_prop(page: dict, name: str, ptype: str):
 # Helpers GHL
 # ============================================================
 
-def ghl_headers() -> dict:
+def ghl_headers():
     return {
         "Authorization": f"Bearer {GHL_TOKEN}",
         "Version": GHL_VERSION,
@@ -148,7 +189,7 @@ def ghl_headers() -> dict:
     }
 
 
-def ghl_get_pipeline(name: Optional[str]) -> dict:
+def ghl_get_pipeline(name):
     r = requests.get(
         f"{GHL_API}/opportunities/pipelines",
         headers=ghl_headers(),
@@ -167,7 +208,7 @@ def ghl_get_pipeline(name: Optional[str]) -> dict:
     return pipelines[0]
 
 
-def ghl_find_contact_by_email(email: str) -> Optional[dict]:
+def ghl_find_contact_by_email(email):
     if not email:
         return None
     r = requests.get(
@@ -181,7 +222,7 @@ def ghl_find_contact_by_email(email: str) -> Optional[dict]:
     return None
 
 
-def ghl_find_contact_by_phone(phone: str) -> Optional[dict]:
+def ghl_find_contact_by_phone(phone):
     if not phone:
         return None
     r = requests.get(
@@ -195,7 +236,7 @@ def ghl_find_contact_by_phone(phone: str) -> Optional[dict]:
     return None
 
 
-def ghl_create_contact(payload: dict) -> Optional[dict]:
+def ghl_create_contact(payload):
     if DRY_RUN:
         log.info("[DRY] criar contacto: %s", payload.get("name") or payload.get("email"))
         return {"id": "DRY_RUN_CONTACT", "dryRun": True}
@@ -205,15 +246,24 @@ def ghl_create_contact(payload: dict) -> Optional[dict]:
         json=payload,
         timeout=30,
     )
-    if r.status_code in (400, 422) and "duplicat" in r.text.lower():
-        return None  # Sinal para fazer outra procura
+    if r.status_code in (400, 422):
+        body_lower = r.text.lower()
+        if any(kw in body_lower for kw in DUPLICATE_KEYWORDS):
+            return None  # caller faz re-search
+        log.error(
+            "GHL %s ao criar contacto '%s' (email=%s, phone=%s): %s",
+            r.status_code,
+            payload.get("name") or "?",
+            payload.get("email"),
+            payload.get("phone"),
+            r.text[:600],
+        )
     r.raise_for_status()
     return r.json().get("contact")
 
 
-def ghl_search_opportunities(contact_id: str, pipeline_id: str) -> list[dict]:
-    """Lista oportunidades deste contacto neste pipeline."""
-    opps: list[dict] = []
+def ghl_search_opportunities(contact_id, pipeline_id):
+    opps = []
     page = 1
     while True:
         r = requests.get(
@@ -235,12 +285,12 @@ def ghl_search_opportunities(contact_id: str, pipeline_id: str) -> list[dict]:
         if not meta.get("nextPage"):
             break
         page = meta.get("nextPage")
-        if page > 10:  # sanidade
+        if page > 10:
             break
     return opps
 
 
-def ghl_create_opportunity(payload: dict) -> Optional[dict]:
+def ghl_create_opportunity(payload):
     if DRY_RUN:
         log.info("[DRY] criar opp: %s no stage %s", payload.get("name"), payload.get("pipelineStageId"))
         return {"id": "DRY_RUN_OPP", "dryRun": True}
@@ -254,7 +304,7 @@ def ghl_create_opportunity(payload: dict) -> Optional[dict]:
     return r.json().get("opportunity")
 
 
-def ghl_update_opportunity(opp_id: str, payload: dict) -> Optional[dict]:
+def ghl_update_opportunity(opp_id, payload):
     if DRY_RUN:
         log.info("[DRY] update opp %s: %s", opp_id, payload)
         return {"id": opp_id, "dryRun": True}
@@ -272,21 +322,11 @@ def ghl_update_opportunity(opp_id: str, payload: dict) -> Optional[dict]:
 # Lógica principal
 # ============================================================
 
-def split_name(full: Optional[str]) -> tuple[str, str]:
-    if not full:
-        return "", ""
-    parts = full.strip().split(maxsplit=1)
-    if len(parts) == 1:
-        return parts[0], ""
-    return parts[0], parts[1]
-
-
-def main() -> int:
+def main():
     log.info("=" * 60)
-    log.info("Sync Notion → GHL %s", "(DRY RUN)" if DRY_RUN else "(LIVE)")
+    log.info("Sync Notion -> GHL %s", "(DRY RUN)" if DRY_RUN else "(LIVE)")
     log.info("=" * 60)
 
-    # 1) Carregar pipeline + stages
     pipeline = ghl_get_pipeline(PIPELINE_NAME or None)
     pipeline_id = pipeline["id"]
     log.info("Pipeline: %s (id=%s)", pipeline["name"], pipeline_id)
@@ -297,13 +337,13 @@ def main() -> int:
         return 1
     log.info("Stages no GHL: %s", " | ".join(s["name"] for s in pipeline["stages"]))
 
-    # Avisar logo se algum mapping aponta para stage que não existe
     for notion_status, ghl_stage in STATUS_TO_STAGE.items():
         if ghl_stage.strip().lower() not in stage_by_name:
-            log.warning("Stage mapeado '%s' (de Notion '%s') NÃO existe no pipeline. Será ignorado.",
-                        ghl_stage, notion_status)
+            log.warning(
+                "Stage '%s' (de Notion '%s') NAO existe no pipeline. Sera ignorado.",
+                ghl_stage, notion_status,
+            )
 
-    # 2) Contadores e report
     counters = {
         "total_leads_notion": 0,
         "skipped_sem_contacto": 0,
@@ -317,23 +357,29 @@ def main() -> int:
         "opp_unchanged": 0,
         "errors": 0,
     }
-    report_lines: list[str] = []
+    report_lines = []
+    error_lines = []
 
-    # 3) Iterar leads
     for page in notion_query_all(NOTION_DB_ID):
         counters["total_leads_notion"] += 1
 
         nome = notion_prop(page, "Nome", "title")
-        email = notion_prop(page, "E-mail", "email")
-        phone = notion_prop(page, "Telefone", "phone_number")
+        email_raw = notion_prop(page, "E-mail", "email")
+        phone_raw = notion_prop(page, "Telefone", "phone_number")
         status = notion_prop(page, "Status", "status")
         origem = notion_prop(page, "Origem", "select")
         ramo = notion_prop(page, "Ramo Atividade", "select")
         notion_url = page.get("url", "")
 
+        # Limpeza/normalização
+        email = email_raw if is_valid_email(email_raw) else None
+        if email_raw and not email:
+            log.warning("Email invalido ignorado em '%s': %s", nome, email_raw)
+        phone = normalize_phone_pt(phone_raw)
+
         if not email and not phone:
             counters["skipped_sem_contacto"] += 1
-            log.info("Skip (sem email nem telefone): %s", nome)
+            log.info("Skip (sem email/telefone valido): %s", nome)
             continue
         if not status:
             counters["skipped_sem_status"] += 1
@@ -348,13 +394,13 @@ def main() -> int:
             log.warning("Status '%s' sem mapping (lead: %s)", status, nome)
             continue
 
-        target_stage_id: Optional[str] = None
+        target_stage_id = None
         if target_stage_name:
             stg = stage_by_name.get(target_stage_name.strip().lower())
             if stg:
                 target_stage_id = stg["id"]
 
-        # 4) Match do contacto
+        # Match do contacto
         contact = None
         if email:
             try:
@@ -368,6 +414,7 @@ def main() -> int:
                 log.exception("Erro a procurar por telefone %s: %s", phone, e)
 
         first, last = split_name(nome)
+        contact_id = None
 
         if contact:
             contact_id = contact["id"]
@@ -389,7 +436,6 @@ def main() -> int:
             try:
                 created = ghl_create_contact(payload)
                 if created is None:
-                    # Conflito de duplicado — tentar procurar outra vez
                     contact = (
                         ghl_find_contact_by_email(email)
                         or ghl_find_contact_by_phone(phone)
@@ -397,17 +443,29 @@ def main() -> int:
                 else:
                     contact = created
                 if not contact:
-                    raise RuntimeError("Não consegui obter ID do contacto após criar")
+                    raise RuntimeError("Nao consegui obter ID do contacto apos criar")
                 contact_id = contact["id"]
                 counters["created_new_contact"] += 1
                 log.info("Criado: %s (id=%s)", nome, contact_id)
-                report_lines.append(f"- Novo contacto criado no GHL: **{nome}** ({email or phone}) [{notion_url}]({notion_url})")
+                report_lines.append(
+                    "- Novo contacto: **" + str(nome) + "** ("
+                    + str(email or phone) + ") "
+                    + ("[Notion](" + notion_url + ")" if notion_url else "")
+                )
             except Exception as e:
                 counters["errors"] += 1
+                err_detail = str(e)[:300]
                 log.exception("Erro a criar contacto %s: %s", nome, e)
+                error_lines.append(
+                    "- **" + str(nome) + "** (email=" + str(email)
+                    + ", phone=" + str(phone) + "): " + err_detail
+                )
                 continue
 
-        # 5) Atualizar/criar oportunidade
+        if not contact_id:
+            continue
+
+        # Atualizar/criar oportunidade
         try:
             opps = ghl_search_opportunities(contact_id, pipeline_id)
         except Exception as e:
@@ -416,7 +474,7 @@ def main() -> int:
 
         if opps:
             opp = opps[0]
-            update_payload: dict = {"pipelineId": pipeline_id}
+            update_payload = {"pipelineId": pipeline_id}
             needs_update = False
 
             if is_lost:
@@ -424,14 +482,16 @@ def main() -> int:
                     update_payload["status"] = "lost"
                     needs_update = True
                     counters["opp_marked_lost"] += 1
-                    report_lines.append(f"- Marcada como Perdida: **{nome}**")
+                    report_lines.append("- Marcada como Perdida: **" + str(nome) + "**")
             elif target_stage_id:
                 if opp.get("pipelineStageId") != target_stage_id:
                     update_payload["pipelineStageId"] = target_stage_id
                     needs_update = True
                     counters["opp_updated_stage"] += 1
-                    report_lines.append(f"- Stage atualizado: **{nome}** → *{target_stage_name}*")
-                # Se vinha como lost mas está agora aberto, repor para open
+                    report_lines.append(
+                        "- Stage atualizado: **" + str(nome)
+                        + "** -> *" + str(target_stage_name) + "*"
+                    )
                 if opp.get("status") == "lost":
                     update_payload["status"] = "open"
                     needs_update = True
@@ -442,12 +502,13 @@ def main() -> int:
                 except Exception as e:
                     counters["errors"] += 1
                     log.exception("Erro a atualizar opp %s: %s", opp["id"], e)
+                    error_lines.append(
+                        "- Update opp falhou: **" + str(nome) + "**: " + str(e)[:200]
+                    )
             else:
                 counters["opp_unchanged"] += 1
         else:
-            # Criar oportunidade nova
             if is_lost and not target_stage_id:
-                # Sem stage destino — usar o primeiro stage do pipeline e marcar lost
                 target_stage_id = pipeline["stages"][0]["id"]
             if not target_stage_id:
                 log.warning("Sem stage destino para %s (status=%s)", nome, status)
@@ -464,15 +525,19 @@ def main() -> int:
                 ghl_create_opportunity(opp_payload)
                 counters["opp_created"] += 1
                 tag = "lost" if is_lost else target_stage_name
-                report_lines.append(f"- Oportunidade criada: **{nome}** → *{tag}*")
+                report_lines.append(
+                    "- Opp criada: **" + str(nome) + "** -> *" + str(tag) + "*"
+                )
             except Exception as e:
                 counters["errors"] += 1
                 log.exception("Erro a criar opp %s: %s", nome, e)
+                error_lines.append(
+                    "- Criar opp falhou: **" + str(nome) + "**: " + str(e)[:200]
+                )
 
-        # throttle suave
         time.sleep(0.1)
 
-    # 6) Relatório
+    # Relatório
     log.info("=" * 60)
     log.info("Resumo:")
     for k, v in counters.items():
@@ -480,26 +545,32 @@ def main() -> int:
 
     timestamp_iso = datetime.now(timezone.utc).isoformat()
     fname_stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    summary_md = (
-        f"# Sync Notion → GHL\n\n"
-        f"**Data (UTC):** {timestamp_iso}\n"
-        f"**Modo:** {'DRY RUN' if DRY_RUN else 'LIVE'}\n\n"
-        f"## Resumo\n\n"
-    )
+    modo = "DRY RUN" if DRY_RUN else "LIVE"
+
+    summary_md = "# Sync Notion -> GHL\n\n"
+    summary_md += "**Data (UTC):** " + timestamp_iso + "\n"
+    summary_md += "**Modo:** " + modo + "\n\n## Resumo\n\n"
     for k, v in counters.items():
-        summary_md += f"- **{k}**: {v}\n"
+        summary_md += "- **" + k + "**: " + str(v) + "\n"
+
     if report_lines:
-        summary_md += "\n## Alterações\n\n" + "\n".join(report_lines) + "\n"
+        summary_md += "\n## Alteracoes\n\n" + "\n".join(report_lines[:200]) + "\n"
+        if len(report_lines) > 200:
+            summary_md += "\n_(... mais " + str(len(report_lines) - 200) + " omitidas)_\n"
     else:
-        summary_md += "\nNada para alterar nesta execução.\n"
+        summary_md += "\nNada para alterar nesta execucao.\n"
+
+    if error_lines:
+        summary_md += "\n## Erros (precisam de atencao)\n\n" + "\n".join(error_lines[:100]) + "\n"
+        if len(error_lines) > 100:
+            summary_md += "\n_(... mais " + str(len(error_lines) - 100) + " erros omitidos)_\n"
 
     os.makedirs("reports", exist_ok=True)
-    fname = f"reports/sync-{fname_stamp}.md"
+    fname = "reports/sync-" + fname_stamp + ".md"
     with open(fname, "w", encoding="utf-8") as f:
         f.write(summary_md)
-    log.info("Relatório guardado em %s", fname)
+    log.info("Relatorio guardado em %s", fname)
 
-    # Em GitHub Actions, escrever também no summary
     gh_summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if gh_summary:
         with open(gh_summary, "a", encoding="utf-8") as f:
