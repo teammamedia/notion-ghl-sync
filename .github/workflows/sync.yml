@@ -1,12 +1,16 @@
 name: Sync Notion -> GHL
 
 on:
+  # Corre todos os domingos às 21:00 UTC (= 22:00 Lisboa no horário de verão,
+  # 21:00 Lisboa no horário de inverno) para chegares à 2ª feira com as
+  # smart lists do GHL já actualizadas.
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 21 * * 0"
+  # Permite correr manualmente a partir do separador "Actions" no GitHub
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Correr em modo DRY RUN (não escreve no GHL)"
+        description: "DRY RUN (não escreve no GHL). Default seguro = true. Para sincronizar de verdade, mete 'false'."
         required: false
         default: "true"
 
@@ -15,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: write
+      contents: write  # para fazer commit dos relatórios
 
     steps:
       - name: Checkout
