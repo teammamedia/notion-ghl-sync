@@ -24,10 +24,21 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 import requests
+
+
+def fold_name(s):
+    """Lowercase + remove acentos + colapsa espaços. Usado para casar nomes
+    do Notion com nomes de stages do GHL de forma tolerante."""
+    if not s:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", s)
+    no_accents = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return " ".join(no_accents.lower().split())
 
 # ============================================================
 # Configuração
@@ -332,6 +343,7 @@ def main():
     log.info("Pipeline: %s (id=%s)", pipeline["name"], pipeline_id)
 
     stage_by_name = {s["name"].strip().lower(): s for s in pipeline.get("stages", [])}
+    stage_by_folded = {fold_name(s["name"]): s for s in pipeline.get("stages", [])}
     if not stage_by_name:
         log.error("Pipeline sem stages! Abortar.")
         return 1
@@ -389,16 +401,27 @@ def main():
         is_lost = status in LOST_STATUSES
         target_stage_name = STATUS_TO_STAGE.get(status)
 
-        if not target_stage_name and not is_lost:
-            counters["stage_sem_mapping"] += 1
-            log.warning("Status '%s' sem mapping (lead: %s)", status, nome)
-            continue
-
         target_stage_id = None
         if target_stage_name:
+            # Mapeamento explícito (dicionário STATUS_TO_STAGE)
             stg = stage_by_name.get(target_stage_name.strip().lower())
             if stg:
                 target_stage_id = stg["id"]
+
+        # Fallback automático: se não há mapping explícito (ou aponta para
+        # stage que não existe), tenta casar o nome do status do Notion
+        # com um stage do GHL (ignora maiúsculas, acentos, espaços extra).
+        if not target_stage_id and not is_lost:
+            auto = stage_by_folded.get(fold_name(status))
+            if auto:
+                target_stage_id = auto["id"]
+                target_stage_name = auto["name"]
+                log.info("Auto-mapping: Notion '%s' -> GHL '%s'", status, auto["name"])
+
+        if not target_stage_name and not is_lost:
+            counters["stage_sem_mapping"] += 1
+            log.warning("Status '%s' sem mapping nem stage igual no GHL (lead: %s)", status, nome)
+            continue
 
         # Match do contacto
         contact = None
